@@ -1,29 +1,28 @@
 import streamlit as st
 import geopandas as gpd
 import pandas as pd
-import pygwalker as pyg
+from pygwalker.api.streamlit import StreamlitRenderer # Import Renderer Khusus
 import zipfile
 import os
 import tempfile
 import shutil
 
-# Konfigurasi Halaman menjadi lebar penuh
+# Konfigurasi Halaman
 st.set_page_config(page_title="SHP Pivot Tool", layout="wide")
 
 st.title("🗺️ SHP Pivot & Analysis Tool")
 st.markdown("""
-Aplikasi ini mengubah data Shapefile (.shp) menjadi interaktif Pivot Table dengan sistem **Drag & Drop**.
-Silakan upload file SHP anda yang sudah di-kompres menjadi **.zip**.
+Aplikasi ini mengubah data Shapefile (.shp) menjadi interaktif Pivot Table.
 """)
 
-# --- Fungsi Helper untuk Ekstrak ZIP ---
-def load_shp_from_zip(zip_file):
+# --- Fungsi Helper dengan Caching (Agar tidak loading ulang terus) ---
+@st.cache_data(show_spinner=False)
+def load_shp_from_zip(zip_file, use_geometry):
     temp_dir = tempfile.mkdtemp()
     try:
         with zipfile.ZipFile(zip_file, 'r') as z:
             z.extractall(temp_dir)
         
-        # Mencari file .shp di dalam folder hasil ekstrak
         shp_file = None
         for root, dirs, files in os.walk(temp_dir):
             for file in files:
@@ -32,47 +31,55 @@ def load_shp_from_zip(zip_file):
                     break
         
         if shp_file:
-            # Membaca data menggunakan Geopandas
-            gdf = gpd.read_file(shp_file)
+            # Jika user tidak butuh peta, kita ignore geometry biar RAM hemat
+            if not use_geometry:
+                gdf = gpd.read_file(shp_file, ignore_geometry=True)
+            else:
+                gdf = gpd.read_file(shp_file)
             return gdf
         else:
             return None
     except Exception as e:
-        st.error(f"Terjadi kesalahan saat membaca file: {e}")
+        st.error(f"Error membaca file: {e}")
         return None
+    finally:
+        # Bersihkan folder temp (opsional, hati-hati jika OS lock file)
+        pass
 
-# --- Upload Area ---
-uploaded_file = st.file_uploader("Upload File ZIP (berisi .shp, .shx, .dbf)", type="zip")
+# --- Fungsi Caching untuk Renderer PyGWalker ---
+@st.cache_resource
+def get_pyg_renderer(dataframe):
+    # Menggunakan StreamlitRenderer khusus agar lebih stabil
+    return StreamlitRenderer(dataframe, spec="./gw_config.json", spec_io_mode="rw")
+
+# --- Interface Utama ---
+uploaded_file = st.file_uploader("Upload File ZIP (Limit file besar tergantung RAM PC Anda)", type="zip")
+
+# Checkbox opsi geometri ditaruh di luar agar user bisa set sebelum upload/proses
+use_geometry = st.checkbox("Sertakan Data Geometri/Peta (Berat untuk file >100MB)", value=False)
 
 if uploaded_file is not None:
-    with st.spinner('Membaca data SHP...'):
-        gdf = load_shp_from_zip(uploaded_file)
+    with st.spinner('Sedang memproses data... (File besar mungkin butuh waktu)'):
+        # Load data
+        df = load_shp_from_zip(uploaded_file, use_geometry)
 
-    if gdf is not None:
-        # Konversi geometri ke string (opsional, agar tidak berat di pivot jika kompleks)
-        # Atau kita bisa drop geometry jika hanya butuh data atribut untuk pivot
-        st.success("File berhasil dimuat!")
+    if df is not None:
+        st.success(f"Data berhasil dimuat! Total Baris: {len(df):,}")
         
-        # Opsi: Gunakan hanya data atribut (tanpa peta) atau tetap dengan Geometri
-        use_geometry = st.checkbox("Sertakan Data Geometri (Peta)", value=False)
-        
-        if not use_geometry:
-            df = pd.DataFrame(gdf.drop(columns='geometry'))
-            st.info("Mode Data Atribut: Kolom geometri dihilangkan untuk performa pivot lebih cepat.")
-        else:
-            df = gdf
-            st.info("Mode Geospasial: Anda bisa drag-and-drop koordinat untuk membuat peta.")
+        # 1. Tampilkan Preview Data (Untuk memastikan data terbaca)
+        with st.expander("🔍 Lihat Preview Data Mentah (5 Baris Pertama)"):
+            st.dataframe(df.head())
 
         st.markdown("---")
-        st.subheader("🛠️ Ruang Kerja Analisis (Drag & Drop)")
-        st.markdown("Geser kolom dari kiri ke sumbu X/Y atau Rows/Columns untuk membuat Pivot Table atau Grafik.")
-
-        # --- INI ADALAH BAGIAN UTAMA (PyGWalker) ---
-        # Ini akan merender HTML interaktif untuk pivot table
-        walker = pyg.walk(df, env='Streamlit', dark='light')
+        st.subheader("🛠️ Ruang Kerja Analisis")
         
+        # 2. Render PyGWalker dengan cara yang lebih stabil
+        try:
+            renderer = get_pyg_renderer(df)
+            renderer.explorer()
+        except Exception as e:
+            st.error(f"Gagal memuat visualisasi: {e}")
+            st.warning("Coba kurangi ukuran file atau jalankan tanpa opsi Geometri.")
+            
     else:
-        st.error("Tidak ditemukan file .shp di dalam ZIP tersebut.")
-
-else:
-    st.info("Silakan upload file .zip untuk memulai.")
+        st.error("Tidak ditemukan file .shp valid dalam ZIP.")
